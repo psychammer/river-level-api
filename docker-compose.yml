@@ -1,20 +1,13 @@
 version: '3.8'
 
-# Defines the services (containers) that make up application.
 services:
-  # 'river-api' is a custom name for service.
-  river-api:
-    # Build the Docker image from the Dockerfile in the current directory (.).
+  #  the service name for clarity
+  prediction-api:
     build: .
-    # Name the image that gets built.
-    image: river-level-api
-    # A friendly name for the running container.
-    container_name: river_level_container
-    # Port mapping:
-    # Maps port 8000 on the computer (host) to port 8000 inside the container.
-    # Format is "HOST:CONTAINER"
+    image: river-level-prediction-api
+    container_name: prediction_api_container
+    # Maps port 8000 on our computer to port 8000 inside the container.
     ports:
       - "8000:8000"
-    # Restart policy:
-    # 'always' ensures the container restarts automatically if it ever stops or crashes.
+    # Restart automatically if it stops.
     restart: always
