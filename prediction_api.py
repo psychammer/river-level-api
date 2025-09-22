@@ -19,7 +19,7 @@ import math
 import logging
 import uvicorn
 import os
-
+import re 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -422,13 +422,24 @@ class DataFetcher:
                     
                     if station_name and station.get('wl'):
                         try:
-                            wl_value = float(station['wl'])
-                            all_data.append({
-                                'datetime': current,
-                                'station': station_name,
-                                'waterlevel': wl_value
-                            })
+                            # 1. Convert the raw value to a string to be safe.
+                            wl_string = str(station['wl'])
+                            
+                            # 2. Use the regex to strip out anything that isn't a digit or a decimal point.
+                            #    This handles '21.62(*)', '26 (*)', '[Error]', etc.
+                            cleaned_wl_string = re.sub(r'[^\d.]', '', wl_string)
+                            
+                            # 3. If the cleaned string is not empty, convert it to a float.
+                            if cleaned_wl_string:
+                                wl_value = float(cleaned_wl_string)
+                                all_data.append({
+                                    'datetime': current,
+                                    'station': station_name,
+                                    'waterlevel': wl_value
+                                })
                         except (ValueError, TypeError):
+                            # This is a final safety net. If conversion still fails,
+                            # just skip this data point.
                             pass
                             
             except Exception as e:
