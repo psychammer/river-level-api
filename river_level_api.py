@@ -392,11 +392,24 @@ class DataFetcher:
                     data = response.json()
                     for item in data:
                         if item['obsnm'] in ['Montalban', 'Nangka', 'San Mateo-1', 'Sto Nino', 'Tumana Bridge']:
+                            wl_value = np.nan
+                            # First, check if the value exists and is not empty
+                            if item['wl']:
+                                try:
+                                    # 1. Convert the value to a string and remove the '(*)'
+                                    cleaned_wl_string = str(item['wl']).replace('(*)', '')
+                                    # 2. Now, convert the clean string to a float
+                                    wl_value = float(cleaned_wl_string)
+                                except (ValueError, TypeError):
+                                    # This is a safety net in case the data is weird in another way
+                                    logger.warning(f"Could not parse cleaned water level value: {item['wl']}")
+                                    wl_value = np.nan
+
                             all_data.append({
                                 'datetime': current_time,
                                 'station': item['obsnm'],
-                                'waterlevel': float(item['wl']) if item['wl'] else np.nan
-                            })
+                                'waterlevel': wl_value  # Use the cleaned value
+})
                             
             except Exception as e:
                 logger.warning(f"Failed to fetch water data for {ymdhm}: {e}")
