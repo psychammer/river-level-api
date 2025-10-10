@@ -23,6 +23,15 @@ import os
 
 # --- Configuration ---
 # All paths point to the /models directory
+import torch
+import torch.nn as nn
+import numpy as np
+from tqdm import tqdm
+from torch_geometric.nn import GCNConv, GATConv
+import math
+import os
+
+# --- Configuration ---
 class EvalConfig:
     MODEL_DIR = './models/'
     FEATURES_FILE = os.path.join(MODEL_DIR, 'imputed_features.npy')
@@ -39,8 +48,10 @@ class EvalConfig:
     NUM_STATIONS = 5
     NUM_FEATURES = 10
     TARGET_FEATURE_IDX = 0
-    LOOKBACK_WINDOW = 24 * 3  # 3 days
+    LOOKBACK_WINDOW = 24 * 3
     FORECAST_HORIZONS = [1, 3, 6, 12, 24, 48]
+    # NEW: Added station order for clear reporting
+    STATION_ORDER = ['MONTALBAN', 'NANGKA', 'SAN MATEO', 'STO NINO', 'TUMANA']
     
     # Hyperparameters (must match training)
     STGAE_GCN_HIDDEN = 64
@@ -56,7 +67,6 @@ class EvalConfig:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 config = EvalConfig()
-
 # --- Model Definitions (Copied from training scripts) ---
 # These are required for PyTorch to load the saved models correctly.
 
@@ -167,6 +177,7 @@ class AblatedGATTransformer(nn.Module):
         transformer_out = self.transformer(transformer_input)
         return self.forecast_head(transformer_out[:, -1, :])
 
+
 # --- Metrics Calculation ---
 class PerformanceMetrics:
     @staticmethod
@@ -185,7 +196,7 @@ class PerformanceMetrics:
 
 # --- Main Evaluation Function ---
 def run_evaluation():
-    print(f"--- Starting Offline Model Evaluation on {config.DEVICE} ---")
+    print(f"--- Starting Offline Model Evaluation (Per-Station) on {config.DEVICE} ---")
     
     # 1. Load data, scalers, and adjacency matrix
     print("Loading data and supporting files...")
@@ -212,70 +223,69 @@ def run_evaluation():
     # 4. Perform sliding window evaluation
     print(f"\nRunning evaluation with a sliding window across {len(features)} timesteps...")
     
-    # This dictionary will store the metric values for every single prediction
-    all_metrics = {
-        'full': {h: {'mae': [], 'rmse': [], 'nse': []} for h in config.FORECAST_HORIZONS},
-        'ablated': {h: {'mae': [], 'rmse': [], 'nse': []} for h in config.FORECAST_HORIZONS}
+    # MODIFIED: New data structure to hold raw predictions and actuals per station
+    all_results = {
+        model: {
+            station: {h: {'preds': [], 'actuals': []} for h in config.FORECAST_HORIZONS}
+            for station in config.STATION_ORDER
+        }
+        for model in ['full', 'ablated']
     }
 
-    # Define the range to iterate over, ensuring there's room for lookback and forecast
     max_horizon = max(config.FORECAST_HORIZONS)
     num_predictions = len(scaled_features) - config.LOOKBACK_WINDOW - max_horizon
     
     for i in tqdm(range(num_predictions), desc="Evaluating"):
         input_start = i
         input_end = i + config.LOOKBACK_WINDOW
-        
-        # Prepare model input
-        input_window = scaled_features[input_start:input_end]
-        input_tensor = torch.tensor(input_window, dtype=torch.float32).unsqueeze(0).to(config.DEVICE)
+        input_tensor = torch.tensor(scaled_features[input_start:input_end], dtype=torch.float32).unsqueeze(0).to(config.DEVICE)
         
         with torch.no_grad():
             full_preds_scaled = full_model(torch.nan_to_num(input_tensor), edge_index)
             ablated_preds_scaled = ablated_model(torch.nan_to_num(input_tensor), edge_index)
 
-        # Evaluate each horizon
         for h in config.FORECAST_HORIZONS:
             truth_idx = input_end + h - 1
-            
-            # Get scaled ground truth for the target feature (water level)
             actual_scaled = scaled_features[truth_idx, :, config.TARGET_FEATURE_IDX]
             
-            # Inverse scale for meaningful metrics
             wl_mean = mean[config.TARGET_FEATURE_IDX]
             wl_std = std[config.TARGET_FEATURE_IDX]
-            
             actual_values = (actual_scaled * wl_std) + wl_mean
             
             full_pred_values = (full_preds_scaled[h].squeeze().cpu().numpy() * wl_std) + wl_mean
             ablated_pred_values = (ablated_preds_scaled[h].squeeze().cpu().numpy() * wl_std) + wl_mean
             
-            # Calculate and append metrics
-            all_metrics['full'][h]['mae'].append(PerformanceMetrics.calculate_mae(actual_values, full_pred_values))
-            all_metrics['full'][h]['rmse'].append(PerformanceMetrics.calculate_rmse(actual_values, full_pred_values))
-            all_metrics['full'][h]['nse'].append(PerformanceMetrics.calculate_nse(actual_values, full_pred_values))
+            # MODIFIED: Store results for each station separately
+            for s_idx, station_name in enumerate(config.STATION_ORDER):
+                all_results['full'][station_name][h]['preds'].append(full_pred_values[s_idx])
+                all_results['full'][station_name][h]['actuals'].append(actual_values[s_idx])
+                
+                all_results['ablated'][station_name][h]['preds'].append(ablated_pred_values[s_idx])
+                all_results['ablated'][station_name][h]['actuals'].append(actual_values[s_idx])
 
-            all_metrics['ablated'][h]['mae'].append(PerformanceMetrics.calculate_mae(actual_values, ablated_pred_values))
-            all_metrics['ablated'][h]['rmse'].append(PerformanceMetrics.calculate_rmse(actual_values, ablated_pred_values))
-            all_metrics['ablated'][h]['nse'].append(PerformanceMetrics.calculate_nse(actual_values, ablated_pred_values))
-
-    # 5. Average and print the final results
-    print("\n\n" + "="*60)
-    print("--- FINAL AVERAGED PERFORMANCE METRICS ---")
-    print("="*60)
+    # 5. Calculate final metrics from the collected results and print
+    print("\n\n" + "="*80)
+    print("--- FINAL AVERAGED PERFORMANCE METRICS (PER-STATION) ---")
+    print("="*80)
     
-    for model_name, metrics_data in all_metrics.items():
-        print(f"\n📊 Results for: {model_name.upper()} Model")
-        print("   Horizon | Avg. MAE | Avg. RMSE | Avg. NSE")
-        print("   " + "-"*45)
-        for h in config.FORECAST_HORIZONS:
-            avg_mae = np.nanmean(metrics_data[h]['mae'])
-            avg_rmse = np.nanmean(metrics_data[h]['rmse'])
-            avg_nse = np.nanmean(metrics_data[h]['nse'])
-            print(f"   {h:<7}h | {avg_mae:8.4f} | {avg_rmse:9.4f} | {avg_nse:8.4f}")
+    for model_name, station_data in all_results.items():
+        print(f"\n\n--- MODEL: {model_name.upper()} ---")
+        for station_name, horizon_data in station_data.items():
+            print(f"\n📊 Station: {station_name}")
+            print("   Horizon | Avg. MAE | Avg. RMSE | Avg. NSE")
+            print("   " + "-"*45)
+            for h in config.FORECAST_HORIZONS:
+                preds = np.array(horizon_data[h]['preds'])
+                actuals = np.array(horizon_data[h]['actuals'])
+                
+                avg_mae = PerformanceMetrics.calculate_mae(actuals, preds)
+                avg_rmse = PerformanceMetrics.calculate_rmse(actuals, preds)
+                avg_nse = PerformanceMetrics.calculate_nse(actuals, preds)
+                
+                print(f"   {h:<7}h | {avg_mae:8.4f} | {avg_rmse:9.4f} | {avg_nse:8.4f}")
     
-    print("\n" + "="*60)
-    print("Evaluation complete. You can now copy these values into your API.")
+    print("\n" + "="*80)
+    print("Evaluation complete. You can now use these detailed values.")
 
 if __name__ == "__main__":
     run_evaluation()
