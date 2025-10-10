@@ -165,19 +165,44 @@ def main():
     print("✅ API is online!\n")
     
     # Get model information
-    print("Model Information:")
+    print("="*80)
+    print("MODEL AND PERFORMANCE OVERVIEW")
+    print("="*80)
     model_info = client.get_model_info()
     if model_info:
         print(f"  Available Models: {model_info.get('available_models')}")
         print(f"  Forecast Horizons: {model_info.get('forecast_horizons')}")
         print(f"  Lookback Window: {model_info.get('lookback_window')} hours")
-        print(f"  Number of Stations: {model_info.get('num_stations')}")
         print(f"  Device: {model_info.get('device')}")
         
-        print("\n  Model Details:")
-        for model_key, model_details in model_info.get('models', {}).items():
-            print(f"    {model_key}: {model_details['name']}")
-            print(f"      - {model_details['description']}")
+        # Display hardcoded performance metrics if available
+        metrics = model_info.get('performance_metrics')
+        if metrics:
+            print("\n--- Average Performance Metrics (from offline evaluation) ---")
+            
+            # Full Model Metrics
+            full_metrics = metrics.get('full_model', {})
+            if full_metrics:
+                print("\n📊 Full Model (STGAE-GAT-Transformer)")
+                print("   Horizon | MAE    | RMSE   | NSE")
+                print("   " + "-"*40)
+                for i, horizon in enumerate(full_metrics.get('horizons', [])):
+                    mae = full_metrics.get('mae', [0]*len(full_metrics.get('horizons',[])))[i]
+                    rmse = full_metrics.get('rmse', [0]*len(full_metrics.get('horizons',[])))[i]
+                    nse = full_metrics.get('nse', [0]*len(full_metrics.get('horizons',[])))[i]
+                    print(f"   {horizon:7s} | {mae:6.3f} | {rmse:6.3f} | {nse:.3f}")
+
+            # Ablated Model Metrics
+            ablated_metrics = metrics.get('ablated_model', {})
+            if ablated_metrics:
+                print("\n📊 Ablated Model (GAT-Transformer)")
+                print("   Horizon | MAE    | RMSE   | NSE")
+                print("   " + "-"*40)
+                for i, horizon in enumerate(ablated_metrics.get('horizons', [])):
+                    mae = ablated_metrics.get('mae', [0]*len(ablated_metrics.get('horizons',[])))[i]
+                    rmse = ablated_metrics.get('rmse', [0]*len(ablated_metrics.get('horizons',[])))[i]
+                    nse = ablated_metrics.get('nse', [0]*len(ablated_metrics.get('horizons',[])))[i]
+                    print(f"   {horizon:7s} | {mae:6.3f} | {rmse:6.3f} | {nse:.3f}")
     
     # Get available stations
     print("\nAvailable Stations:")

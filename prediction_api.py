@@ -24,6 +24,23 @@ import re
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+PRECOMPUTED_METRICS = {
+    "full_model": {
+        "horizons": ["1h", "3h", "6h", "12h", "24h", "48h"],
+        "mae":  [0.3500, 0.3495, 0.3502, 0.3609, 0.3823, 0.4235],
+        "rmse": [0.4779, 0.4746, 0.4793, 0.4949, 0.5203, 0.5806],
+        "nse":  [-1642.2619, -1452.1706, -1562.2663, -1375.3926, -1436.9869, -1279.2282]
+    },
+    "ablated_model": {
+        "horizons": ["1h", "3h", "6h", "12h", "24h", "48h"],
+        "mae":  [0.3524, 0.3753, 0.3833, 0.3871, 0.3854, 0.4308],
+        "rmse": [0.4751, 0.5037, 0.5155, 0.5208, 0.5274, 0.5885],
+        "nse":  [-1499.0327, -1563.3328, -1374.7616, -1423.1519, -1348.1682, -1421.0928]
+    }
+}
+
+
 # --- Configuration ---
 class Config:
     # Model paths (adjust these to your deployed environment)
@@ -840,7 +857,7 @@ async def get_stations():
 
 @app.get("/model_info")
 async def get_model_info():
-    """Get information about the models"""
+    """Get information about the models, including performance metrics."""
     return {
         "available_models": model_manager.available_models if model_manager else [],
         "models": {
@@ -859,7 +876,8 @@ async def get_model_info():
         "forecast_horizons": config.FORECAST_HORIZONS,
         "lookback_window": config.LOOKBACK_WINDOW,
         "num_stations": config.NUM_STATIONS,
-        "device": config.DEVICE
+        "device": config.DEVICE,
+        "performance_metrics": PRECOMPUTED_METRICS #Add the metrics to the response
     }
 
 @app.post("/compare_models")
