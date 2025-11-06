@@ -49,7 +49,7 @@ class EvalConfig:
     NUM_FEATURES = 10
     TARGET_FEATURE_IDX = 0
     LOOKBACK_WINDOW = 24 * 3
-    FORECAST_HORIZONS = [1, 3, 6, 12, 24, 48]
+    FORECAST_HORIZONS = list(range(1, 49))
     # NEW: Added station order for clear reporting
     STATION_ORDER = ['MONTALBAN', 'NANGKA', 'SAN MATEO', 'STO NINO', 'TUMANA']
     
@@ -132,8 +132,11 @@ class TemporalTransformer(nn.Module):
         return self.transformer(x)
 
 class MultiHorizonForecastHead(nn.Module):
-    def __init__(self, input_dim, horizons, num_stations):
+    def __init__(self, input_dim, horizons, num_stations, target_feature_idx):
         super().__init__()
+        self.horizons = horizons # Added this line
+        self.num_stations = num_stations # Added this line
+        self.target_feature_idx = target_feature_idx # Added this line
         self.forecast_heads = nn.ModuleDict({
             f'horizon_{h}': nn.Sequential(nn.Linear(input_dim, input_dim // 2), nn.ReLU(), nn.Dropout(0.1), nn.Linear(input_dim // 2, num_stations))
             for h in horizons
@@ -147,7 +150,7 @@ class STGAEGATTransformer(nn.Module):
         self.stgae_encoder = FrozenSTGAEEncoder(config.NUM_FEATURES, config.STGAE_GCN_HIDDEN, config.STGAE_GRU_HIDDEN_FACTOR * config.NUM_STATIONS, config.ENCODER_PATH)
         self.gat = GraphAttentionLayer(config.GAT_IN_FEATURES_FULL, config.GAT_HIDDEN_DIM, config.GAT_HEADS)
         self.transformer = TemporalTransformer(config.TRANSFORMER_D_MODEL, config.TRANSFORMER_HEADS, config.TRANSFORMER_LAYERS, config.TRANSFORMER_FF_DIM, config.LOOKBACK_WINDOW)
-        self.forecast_head = MultiHorizonForecastHead(config.TRANSFORMER_D_MODEL, config.FORECAST_HORIZONS, config.NUM_STATIONS)
+        self.forecast_head = MultiHorizonForecastHead(config.TRANSFORMER_D_MODEL, config.FORECAST_HORIZONS, config.NUM_STATIONS, config.TARGET_FEATURE_IDX)
     def forward(self, x, edge_index):
         batch_size, seq_len, num_nodes, _ = x.shape
         with torch.no_grad(): gcn_features, _ = self.stgae_encoder(x, edge_index)
@@ -165,7 +168,7 @@ class AblatedGATTransformer(nn.Module):
         super().__init__()
         self.gat = GraphAttentionLayer(config.GAT_IN_FEATURES_ABLATED, config.GAT_HIDDEN_DIM, config.GAT_HEADS)
         self.transformer = TemporalTransformer(config.TRANSFORMER_D_MODEL, config.TRANSFORMER_HEADS, config.TRANSFORMER_LAYERS, config.TRANSFORMER_FF_DIM, config.LOOKBACK_WINDOW)
-        self.forecast_head = MultiHorizonForecastHead(config.TRANSFORMER_D_MODEL, config.FORECAST_HORIZONS, config.NUM_STATIONS)
+        self.forecast_head = MultiHorizonForecastHead(config.TRANSFORMER_D_MODEL, config.FORECAST_HORIZONS, config.NUM_STATIONS, config.TARGET_FEATURE_IDX)
     def forward(self, x, edge_index):
         batch_size, seq_len, num_nodes, num_features = x.shape
         x_flat = x.reshape(-1, num_features)

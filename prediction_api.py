@@ -111,7 +111,7 @@ class Config:
     NUM_FEATURES = 10
     TARGET_FEATURE_IDX = 0  # water level
     LOOKBACK_WINDOW = 24 * 3  # 3 days
-    FORECAST_HORIZONS = [1, 3, 6, 12, 24, 48]
+    FORECAST_HORIZONS = list(range(1, 49))
     
     # Station configuration
     STATION_CONFIG = {
