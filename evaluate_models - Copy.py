@@ -20,8 +20,6 @@ from tqdm import tqdm
 from torch_geometric.nn import GCNConv, GATConv
 import math
 import os
-import json
-from torch.utils.data import DataLoader, Dataset
 
 # --- Configuration ---
 # All paths point to the /models directory
@@ -69,32 +67,6 @@ class EvalConfig:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 config = EvalConfig()
-
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, features, lookback, horizons):
-        self.features = features
-        self.lookback = lookback
-        self.max_horizon = max(horizons)
-        # We stop early enough so we have ground truth for the furthest horizon
-        self.length = len(features) - lookback - self.max_horizon
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        # Input: The lookback window
-        input_seq = self.features[idx : idx + self.lookback]
-        
-        # Targets: The actual values for every specific horizon we want to predict
-        # We calculate the indices for the horizons relative to the end of the input
-        input_end = idx + self.lookback
-        
-        # We need the index of the target for every horizon in config.FORECAST_HORIZONS
-        # But to keep __getitem__ fast and simple, we usually just return the index 
-        # and fetch full targets later, OR return the raw target indices.
-        # Let's return the start index so we can fetch targets in bulk later to save RAM/CPU.
-        return torch.tensor(input_seq, dtype=torch.float32), idx
 # --- Model Definitions (Copied from training scripts) ---
 # These are required for PyTorch to load the saved models correctly.
 
@@ -227,178 +199,96 @@ class PerformanceMetrics:
 
 # --- Main Evaluation Function ---
 def run_evaluation():
-    print(f"--- Starting Optimized Offline Evaluation on {config.DEVICE} ---")
+    print(f"--- Starting Offline Model Evaluation (Per-Station) on {config.DEVICE} ---")
     
-    # 1. Load data
+    # 1. Load data, scalers, and adjacency matrix
+    print("Loading data and supporting files...")
     features = np.load(config.FEATURES_FILE)
     adj_matrix = np.load(config.ADJ_FILE)
     mean = np.load(config.SCALER_MEAN_FILE)
     std = np.load(config.SCALER_STD_FILE)
     edge_index = torch.tensor(np.where(adj_matrix > 0), dtype=torch.long).to(config.DEVICE)
     
-    # 2. Load models
+    # 2. Load trained models
     full_model = STGAEGATTransformer(config).to(config.DEVICE)
     full_model.load_state_dict(torch.load(config.FULL_MODEL_PATH, map_location=config.DEVICE))
     full_model.eval()
+    print("✅ Full model loaded successfully.")
     
     ablated_model = AblatedGATTransformer(config).to(config.DEVICE)
     ablated_model.load_state_dict(torch.load(config.ABLATED_MODEL_PATH, map_location=config.DEVICE))
     ablated_model.eval()
+    print("✅ Ablated model loaded successfully.")
 
-    # 3. Scale data
+    # 3. Scale the data
     scaled_features = (features - mean) / (std + 1e-8)
     
-    # 4. Create DataLoader (The Key to Speed)
-    BATCH_SIZE = 64  # Process 64 time windows at once!
-    dataset = TimeSeriesDataset(scaled_features, config.LOOKBACK_WINDOW, config.FORECAST_HORIZONS)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    # 4. Perform sliding window evaluation
+    print(f"\nRunning evaluation with a sliding window across {len(features)} timesteps...")
     
-    print(f"Data loaded. Total batches: {len(loader)}")
-
-    # 5. Bulk Inference
-    # We will store results in lists first, then convert to numpy
-    # Structure: [Horizon][Model] -> list of batch outputs
-    results_store = {
-        'full': {h: [] for h in config.FORECAST_HORIZONS},
-        'ablated': {h: [] for h in config.FORECAST_HORIZONS},
-        'indices': [] # To track which time steps correspond to predictions
+    # MODIFIED: New data structure to hold raw predictions and actuals per station
+    all_results = {
+        model: {
+            station: {h: {'preds': [], 'actuals': []} for h in config.FORECAST_HORIZONS}
+            for station in config.STATION_ORDER
+        }
+        for model in ['full', 'ablated']
     }
 
-    print("Running Batch Inference...")
-    with torch.no_grad():
-        for batch_x, batch_idx in tqdm(loader):
-            batch_x = batch_x.to(config.DEVICE)
-            batch_x = torch.nan_to_num(batch_x)
+    max_horizon = max(config.FORECAST_HORIZONS)
+    num_predictions = len(scaled_features) - config.LOOKBACK_WINDOW - max_horizon
+    
+    for i in tqdm(range(num_predictions), desc="Evaluating"):
+        input_start = i
+        input_end = i + config.LOOKBACK_WINDOW
+        input_tensor = torch.tensor(scaled_features[input_start:input_end], dtype=torch.float32).unsqueeze(0).to(config.DEVICE)
+        
+        with torch.no_grad():
+            full_preds_scaled = full_model(torch.nan_to_num(input_tensor), edge_index)
+            ablated_preds_scaled = ablated_model(torch.nan_to_num(input_tensor), edge_index)
+
+        for h in config.FORECAST_HORIZONS:
+            truth_idx = input_end + h - 1
+            actual_scaled = scaled_features[truth_idx, :, config.TARGET_FEATURE_IDX]
             
-            # Forward pass (Batched)
-            full_out = full_model(batch_x, edge_index)
-            ablated_out = ablated_model(batch_x, edge_index)
+            wl_mean = mean[config.TARGET_FEATURE_IDX]
+            wl_std = std[config.TARGET_FEATURE_IDX]
+            actual_values = (actual_scaled * wl_std) + wl_mean
             
-            # Store predictions on CPU to free GPU memory
+            full_pred_values = (full_preds_scaled[h].squeeze().cpu().numpy() * wl_std) + wl_mean
+            ablated_pred_values = (ablated_preds_scaled[h].squeeze().cpu().numpy() * wl_std) + wl_mean
+            
+            # MODIFIED: Store results for each station separately
+            for s_idx, station_name in enumerate(config.STATION_ORDER):
+                all_results['full'][station_name][h]['preds'].append(full_pred_values[s_idx])
+                all_results['full'][station_name][h]['actuals'].append(actual_values[s_idx])
+                
+                all_results['ablated'][station_name][h]['preds'].append(ablated_pred_values[s_idx])
+                all_results['ablated'][station_name][h]['actuals'].append(actual_values[s_idx])
+
+    # 5. Calculate final metrics from the collected results and print
+    print("\n\n" + "="*80)
+    print("--- FINAL AVERAGED PERFORMANCE METRICS (PER-STATION) ---")
+    print("="*80)
+    
+    for model_name, station_data in all_results.items():
+        print(f"\n\n--- MODEL: {model_name.upper()} ---")
+        for station_name, horizon_data in station_data.items():
+            print(f"\n📊 Station: {station_name}")
+            print("   Horizon | Avg. MAE | Avg. RMSE | Avg. NSE")
+            print("   " + "-"*45)
             for h in config.FORECAST_HORIZONS:
-                results_store['full'][h].append(full_out[h].cpu().numpy())
-                results_store['ablated'][h].append(ablated_out[h].cpu().numpy())
-            
-            results_store['indices'].append(batch_idx.numpy())
-
-    # 6. Post-Processing (Concatenate everything)
-    print("Processing metrics...")
-    
-    # Flatten indices
-    all_indices = np.concatenate(results_store['indices'])
-    
-    # Prepare storage for final metrics
-    final_metrics = {
-        "full_model": {},
-        "ablated_model": {}
-    }
-    
-    # Initialize dictionary structure
-    for model_key in final_metrics:
-        for station in config.STATION_ORDER:
-            final_metrics[model_key][station] = {
-                "horizons": [f"{h}h" for h in config.FORECAST_HORIZONS],
-                "mae": [], "rmse": [], "nse": []
-            }
-
-    # Descaling constants
-    wl_mean = mean[config.TARGET_FEATURE_IDX]
-    wl_std = std[config.TARGET_FEATURE_IDX]
-
-    # Process each horizon using Vectorized Operations (Much faster than loops)
-    for h in tqdm(config.FORECAST_HORIZONS, desc="Calculating Metrics"):
-        
-        # Concatenate predictions for this horizon across all batches
-        # Shape: (Total_Samples, Num_Stations)
-        pred_full_scaled = np.concatenate(results_store['full'][h], axis=0)
-        pred_ablated_scaled = np.concatenate(results_store['ablated'][h], axis=0)
-        
-        # Get Ground Truth for this horizon
-        # Target index = current_index + lookback + horizon - 1
-        target_indices = all_indices + config.LOOKBACK_WINDOW + h - 1
-        actual_scaled = scaled_features[target_indices, :, config.TARGET_FEATURE_IDX]
-        
-        # Descale everything at once
-        actuals = (actual_scaled * wl_std) + wl_mean
-        preds_full = (pred_full_scaled * wl_std) + wl_mean
-        preds_ablated = (pred_ablated_scaled * wl_std) + wl_mean
-        
-        # Calculate metrics per station
-        for s_idx, station in enumerate(config.STATION_ORDER):
-            # Slice data for this specific station
-            st_actuals = actuals[:, s_idx]
-            st_preds_full = preds_full[:, s_idx]
-            st_preds_ablated = preds_ablated[:, s_idx]
-            
-            # --- Metrics for Full Model ---
-            mae = PerformanceMetrics.calculate_mae(st_actuals, st_preds_full)
-            rmse = PerformanceMetrics.calculate_rmse(st_actuals, st_preds_full)
-            nse = PerformanceMetrics.calculate_nse(st_actuals, st_preds_full)
-            
-            final_metrics["full_model"][station]['mae'].append(round(float(mae), 4))
-            final_metrics["full_model"][station]['rmse'].append(round(float(rmse), 4))
-            final_metrics["full_model"][station]['nse'].append(round(float(nse), 4))
-            
-            # --- Metrics for Ablated Model ---
-            mae = PerformanceMetrics.calculate_mae(st_actuals, st_preds_ablated)
-            rmse = PerformanceMetrics.calculate_rmse(st_actuals, st_preds_ablated)
-            nse = PerformanceMetrics.calculate_nse(st_actuals, st_preds_ablated)
-            
-            final_metrics["ablated_model"][station]['mae'].append(round(float(mae), 4))
-            final_metrics["ablated_model"][station]['rmse'].append(round(float(rmse), 4))
-            final_metrics["ablated_model"][station]['nse'].append(round(float(nse), 4))
-
-     # 7. Save to file instead of printing
-    output_filename = "computed_metrics.py"
-    print(f"\n" + "="*60)
-    print(f"Writing metrics to file: {output_filename}")
-    print("="*60)
-    
-    try:
-        with open(output_filename, "w") as f:
-            f.write("# PASTE THIS INTO prediction_api.py\n")
-            f.write("# Replace the existing PRECOMPUTED_METRICS dictionary\n\n")
-            f.write("PRECOMPUTED_METRICS = {\n")
-            
-            # Iterate through models (full, ablated)
-            model_keys = list(final_metrics.keys())
-            for i, m_key in enumerate(model_keys):
-                f.write(f'    "{m_key}": {{\n')
+                preds = np.array(horizon_data[h]['preds'])
+                actuals = np.array(horizon_data[h]['actuals'])
                 
-                # Iterate through stations
-                station_keys = list(final_metrics[m_key].keys())
-                for j, s_key in enumerate(station_keys):
-                    data = final_metrics[m_key][s_key]
-                    f.write(f'        "{s_key}": {{\n')
-                    
-                    # 1. Horizons (Strings) - Keep raw list representation
-                    # We use replace to ensure double quotes if preferred, though single is fine.
-                    horizons_str = str(data['horizons']).replace("'", '"')
-                    f.write(f'            "horizons": {horizons_str},\n')
-                    
-                    # 2. Helper to format float lists horizontally with 4 decimals
-                    def format_list(lst):
-                        return "[" + ", ".join(f"{x:.4f}" for x in lst) + "]"
-
-                    # 3. Metrics
-                    f.write(f'            "mae":  {format_list(data["mae"])},\n')
-                    f.write(f'            "rmse": {format_list(data["rmse"])},\n')
-                    f.write(f'            "nse":  {format_list(data["nse"])}\n')
-                    
-                    # Close Station block
-                    comma = "," if j < len(station_keys) - 1 else ""
-                    f.write(f'        }}{comma}\n')
+                avg_mae = PerformanceMetrics.calculate_mae(actuals, preds)
+                avg_rmse = PerformanceMetrics.calculate_rmse(actuals, preds)
+                avg_nse = PerformanceMetrics.calculate_nse(actuals, preds)
                 
-                # Close Model block
-                comma = "," if i < len(model_keys) - 1 else ""
-                f.write(f'    }}{comma}\n')
-            
-            f.write("}\n")
-            
-        print(f"✅ Success! The file '{output_filename}' has been created.")
-        
-    except Exception as e:
-        print(f"❌ Error writing to file: {e}")
+                print(f"   {h:<7}h | {avg_mae:8.4f} | {avg_rmse:9.4f} | {avg_nse:8.4f}")
+    
+    print("\n" + "="*80)
+    print("Evaluation complete. You can now use these detailed values.")
 
 if __name__ == "__main__":
     run_evaluation()
